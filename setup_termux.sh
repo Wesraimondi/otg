@@ -8,20 +8,12 @@ echo "============================================="
 echo "[*] Solicitando permissão de armazenamento (aceite no pop-up do Android)..."
 termux-setup-storage
 
-# 2. Atualizar repositórios
-echo "[*] Atualizando pacotes..."
-pkg update -y && pkg upgrade -y
+# 2. Atualizar repositórios e instalar Python
+echo "[*] Instalando Python..."
+pkg update -y
+pkg install -y python
 
-# 3. Instalar Python, Git e ferramentas básicas
-echo "[*] Instalando Python e utilitários..."
-pkg install -y python git clang libjpeg-turbo
-
-# 4. Instalar dependências Python
-echo "[*] Instalando bibliotecas do NAS..."
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 5. Dar permissão de execução ao script de inicialização
+# 3. Dar permissão de execução
 chmod +x start.sh
 
 echo ""

@@ -1,4 +1,2 @@
-fastapi>=0.110.0
-uvicorn>=0.28.0
-python-multipart>=0.0.9
-psutil>=5.9.8
+# Este projeto usa 100% bibliotecas padrão do Python (Zero dependências externas).
+# Não é necessário instalar nada via pip!

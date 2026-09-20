@@ -1,37 +1,24 @@
+cd ~/otg
+cat << 'EOF' > app.py
+#!/usr/bin/env python3
 import os
 import sys
+import json
 import shutil
+import urllib.parse
 import mimetypes
 import zipfile
 import tempfile
-from typing import List, Optional
-from pathlib import Path
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+import re
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+PORT = int(os.environ.get("PORT", 8080))
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app = FastAPI(title="Android Tablet NAS", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Helper function to detect available drives / storage locations
 def get_storage_drives():
     drives = []
-    
-    # 1. Check Android specific paths
+
     android_internal = "/storage/emulated/0"
     if os.path.exists(android_internal):
         try:
@@ -49,7 +36,6 @@ def get_storage_drives():
         except Exception:
             pass
 
-    # 2. Check Android OTG / SD Cards in /storage
     if os.path.exists("/storage"):
         try:
             for item in os.listdir("/storage"):
@@ -58,7 +44,6 @@ def get_storage_drives():
                     if os.path.isdir(full_path) and os.access(full_path, os.R_OK):
                         try:
                             usage = shutil.disk_usage(full_path)
-                            # Name it USB OTG or SD Card based on label / heuristic
                             drives.append({
                                 "id": f"otg_{item}",
                                 "name": f"USB OTG / SD ({item})",
@@ -74,7 +59,6 @@ def get_storage_drives():
         except Exception:
             pass
 
-    # 3. Check /mnt/media_rw for rooted/direct OTG mounts
     if os.path.exists("/mnt/media_rw"):
         try:
             for item in os.listdir("/mnt/media_rw"):
@@ -97,7 +81,6 @@ def get_storage_drives():
         except Exception:
             pass
 
-    # 4. Termux Home Directory (if on Android)
     termux_home = os.environ.get("HOME", "/data/data/com.termux/files/home")
     if os.path.exists(termux_home) and not any(d["path"] == termux_home for d in drives):
         try:
@@ -115,28 +98,6 @@ def get_storage_drives():
         except Exception:
             pass
 
-    # 5. Fallback for Windows / Linux Desktop development & testing
-    if not drives:
-        if HAS_PSUTIL:
-            for part in psutil.disk_partitions(all=False):
-                try:
-                    if 'cdrom' in part.opts or part.fstype == '':
-                        continue
-                    usage = psutil.disk_usage(part.mountpoint)
-                    drives.append({
-                        "id": f"drive_{part.mountpoint.replace(':', '').replace('\\\\', '').replace('/', '')}",
-                        "name": f"Unidade ({part.mountpoint})",
-                        "path": part.mountpoint,
-                        "type": "fixed",
-                        "total": usage.total,
-                        "used": usage.used,
-                        "free": usage.free,
-                        "percent": usage.percent
-                    })
-                except Exception:
-                    continue
-
-    # 6. Fallback to current working dir if still empty
     if not drives:
         cwd = os.getcwd()
         usage = shutil.disk_usage(cwd)
@@ -158,81 +119,42 @@ def get_file_category(filename: str, is_dir: bool) -> str:
     if is_dir:
         return "folder"
     ext = os.path.splitext(filename)[1].lower()
-    
     if ext in ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.3gp', '.m4v']:
         return "video"
     elif ext in ['.mp3', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus']:
         return "audio"
-    elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico', '.tiff']:
+    elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico']:
         return "image"
     elif ext in ['.pdf']:
         return "pdf"
-    elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.apk', '.iso']:
+    elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.apk']:
         return "archive"
-    elif ext in ['.txt', '.md', '.log', '.json', '.xml', '.html', '.css', '.js', '.py', '.sh', '.yaml', '.yml', '.csv', '.c', '.cpp', '.java', '.kt', '.php']:
+    elif ext in ['.txt', '.md', '.log', '.json', '.xml', '.html', '.css', '.js', '.py', '.sh', '.yaml', '.yml', '.csv']:
         return "code"
-    elif ext in ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp']:
+    elif ext in ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
         return "document"
     return "file"
 
 
-@app.get("/api/drives")
-def api_get_drives():
-    return get_storage_drives()
-
-
-@app.get("/api/system-status")
-def api_get_system_status():
+def get_system_status():
     battery_info = {"percent": None, "charging": False, "present": False}
-    
-    # Check psutil battery if available
-    if HAS_PSUTIL:
-        try:
-            batt = psutil.sensors_battery()
-            if batt is not None:
-                battery_info = {
-                    "percent": int(batt.percent),
-                    "charging": batt.power_plugged,
-                    "present": True
-                }
-        except Exception:
-            pass
+    try:
+        capacity_path = "/sys/class/power_supply/battery/capacity"
+        status_path = "/sys/class/power_supply/battery/status"
+        if os.path.exists(capacity_path):
+            with open(capacity_path, "r") as f:
+                cap = int(f.read().strip())
+            charging = False
+            if os.path.exists(status_path):
+                with open(status_path, "r") as f:
+                    stat = f.read().strip().lower()
+                    charging = (stat == "charging" or stat == "full")
+            battery_info = {"percent": cap, "charging": charging, "present": True}
+    except Exception:
+        pass
 
-    # Android /sys/class/power_supply/battery (Linux standard)
-    if not battery_info["present"]:
-        try:
-            capacity_path = "/sys/class/power_supply/battery/capacity"
-            status_path = "/sys/class/power_supply/battery/status"
-            if os.path.exists(capacity_path):
-                with open(capacity_path, "r") as f:
-                    cap = int(f.read().strip())
-                charging = False
-                if os.path.exists(status_path):
-                    with open(status_path, "r") as f:
-                        stat = f.read().strip().lower()
-                        charging = (stat == "charging" or stat == "full")
-                battery_info = {
-                    "percent": cap,
-                    "charging": charging,
-                    "present": True
-                }
-        except Exception:
-            pass
-
-    # RAM calculation
     mem_info = {"total": 0, "used": 0, "free": 0, "percent": 0}
-    if HAS_PSUTIL:
-        try:
-            mem = psutil.virtual_memory()
-            mem_info = {
-                "total": mem.total,
-                "used": mem.used,
-                "free": mem.available,
-                "percent": mem.percent
-            }
-        except Exception:
-            pass
-    elif os.path.exists("/proc/meminfo"):
+    if os.path.exists("/proc/meminfo"):
         try:
             mem_dict = {}
             with open("/proc/meminfo", "r") as f:
@@ -250,251 +172,357 @@ def api_get_system_status():
         except Exception:
             pass
 
-    cpu_usage = 0
-    if HAS_PSUTIL:
-        try:
-            cpu_usage = psutil.cpu_percent(interval=None)
-        except Exception:
-            pass
-
     return {
         "battery": battery_info,
         "memory": mem_info,
-        "cpu_percent": cpu_usage,
+        "cpu_percent": 0,
         "drives": get_storage_drives()
     }
 
 
-@app.get("/api/files")
-def list_files(path: str = Query(..., description="Caminho do diretório a listar")):
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Diretório não encontrado")
-    
-    if not os.path.isdir(path):
-        raise HTTPException(status_code=400, detail="O caminho especificado não é um diretório")
+class NASRequestHandler(BaseHTTPRequestHandler):
+    def send_json(self, data, status_code=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
-    try:
-        entries = []
-        with os.scandir(path) as scanner:
-            for entry in scanner:
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/" or path == "/index.html":
+            index_file = os.path.join(STATIC_DIR, "index.html")
+            if os.path.exists(index_file):
+                self.serve_static(index_file, "text/html; charset=utf-8")
+            else:
+                self.send_json({"error": "Interface web não encontrada"}, 404)
+            return
+
+        if path.startswith("/static/"):
+            rel_path = path[8:]
+            file_path = os.path.join(STATIC_DIR, rel_path)
+            if os.path.exists(file_path) and os.path.isfile(file_path):
+                mime, _ = mimetypes.guess_type(file_path)
+                self.serve_static(file_path, mime or "application/octet-stream")
+            else:
+                self.send_json({"error": "Arquivo estático não encontrado"}, 404)
+            return
+
+        if path == "/api/drives":
+            self.send_json(get_storage_drives())
+            return
+
+        if path == "/api/system-status":
+            self.send_json(get_system_status())
+            return
+
+        if path == "/api/files":
+            dir_path = query.get("path", [""])[0]
+            if not dir_path or not os.path.exists(dir_path):
+                self.send_json({"detail": "Diretório não encontrado"}, 404)
+                return
+            if not os.path.isdir(dir_path):
+                self.send_json({"detail": "O caminho não é um diretório"}, 400)
+                return
+
+            try:
+                entries = []
+                with os.scandir(dir_path) as scanner:
+                    for entry in scanner:
+                        try:
+                            stat = entry.stat()
+                            is_dir = entry.is_dir(follow_symlinks=True)
+                            entries.append({
+                                "name": entry.name,
+                                "path": os.path.abspath(entry.path),
+                                "is_dir": is_dir,
+                                "size": stat.st_size if not is_dir else 0,
+                                "modified": stat.st_mtime,
+                                "category": get_file_category(entry.name, is_dir),
+                                "readable": True
+                            })
+                        except (PermissionError, FileNotFoundError):
+                            continue
+
+                entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+                parent = os.path.dirname(os.path.abspath(dir_path))
+                if parent == os.path.abspath(dir_path):
+                    parent = None
+
+                self.send_json({
+                    "current_path": os.path.abspath(dir_path),
+                    "parent_path": parent,
+                    "items": entries,
+                    "count": len(entries)
+                })
+            except PermissionError:
+                self.send_json({"detail": "Permissão negada ao acessar este diretório"}, 403)
+            except Exception as e:
+                self.send_json({"detail": str(e)}, 500)
+            return
+
+        if path == "/api/stream":
+            file_path = query.get("path", [""])[0]
+            if not file_path or not os.path.exists(file_path) or os.path.isdir(file_path):
+                self.send_json({"detail": "Arquivo não encontrado"}, 404)
+                return
+            self.serve_file_with_range(file_path)
+            return
+
+        if path == "/api/download-zip":
+            dir_path = query.get("path", [""])[0]
+            if not dir_path or not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+                self.send_json({"detail": "Diretório não encontrado"}, 404)
+                return
+            self.serve_folder_zip(dir_path)
+            return
+
+        if path == "/api/text-content":
+            file_path = query.get("path", [""])[0]
+            if not file_path or not os.path.exists(file_path) or os.path.isdir(file_path):
+                self.send_json({"detail": "Arquivo não encontrado"}, 404)
+                return
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(5 * 1024 * 1024)
+                self.send_json({"content": content, "filename": os.path.basename(file_path)})
+            except Exception as e:
+                self.send_json({"detail": str(e)}, 500)
+            return
+
+        self.send_json({"error": "Endpoint não encontrado"}, 404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/mkdir":
+            params = self.parse_form_data()
+            parent = params.get("parent_path", "")
+            name = params.get("name", "").strip()
+            if not parent or not name:
+                self.send_json({"detail": "Nome da pasta inválido"}, 400)
+                return
+            target = os.path.join(parent, name)
+            try:
+                os.makedirs(target, exist_ok=True)
+                self.send_json({"success": True, "path": target})
+            except Exception as e:
+                self.send_json({"detail": str(e)}, 500)
+            return
+
+        if path == "/api/rename":
+            params = self.parse_form_data()
+            old_path = params.get("old_path", "")
+            new_name = params.get("new_name", "").strip()
+            if not old_path or not new_name or not os.path.exists(old_path):
+                self.send_json({"detail": "Item não encontrado"}, 404)
+                return
+            parent = os.path.dirname(old_path)
+            target = os.path.join(parent, new_name)
+            try:
+                os.rename(old_path, target)
+                self.send_json({"success": True, "path": target})
+            except Exception as e:
+                self.send_json({"detail": str(e)}, 500)
+            return
+
+        if path == "/api/delete":
+            params = self.parse_form_data()
+            paths = params.get("paths", [])
+            if isinstance(paths, str):
+                paths = [paths]
+            deleted = []
+            for p in paths:
                 try:
-                    stat = entry.stat()
-                    is_dir = entry.is_dir(follow_symlinks=True)
-                    size = stat.st_size if not is_dir else 0
-                    mtime = stat.st_mtime
-                    category = get_file_category(entry.name, is_dir)
-                    
-                    entries.append({
-                        "name": entry.name,
-                        "path": os.path.abspath(entry.path),
-                        "is_dir": is_dir,
-                        "size": size,
-                        "modified": mtime,
-                        "category": category,
-                        "readable": True
-                    })
-                except (PermissionError, FileNotFoundError):
-                    continue
+                    if os.path.isdir(p):
+                        shutil.rmtree(p)
+                    elif os.path.exists(p):
+                        os.remove(p)
+                    deleted.append(p)
+                except Exception:
+                    pass
+            self.send_json({"deleted": deleted})
+            return
 
-        # Sort: directories first, then alphabetical case-insensitive
-        entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
-        
-        # Parent directory
-        parent = os.path.dirname(os.path.abspath(path))
-        if parent == os.path.abspath(path):
-            parent = None
+        if path == "/api/upload":
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in content_type:
+                self.send_json({"detail": "Content-Type inválido"}, 400)
+                return
+            self.handle_multipart_upload()
+            return
 
-        return {
-            "current_path": os.path.abspath(path),
-            "parent_path": parent,
-            "items": entries,
-            "count": len(entries)
-        }
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Permissão negada ao acessar este diretório")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {str(e)}")
+        self.send_json({"error": "Endpoint não encontrado"}, 404)
 
+    def parse_form_data(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        post_data = self.rfile.read(content_length)
+        content_type = self.headers.get("Content-Type", "")
 
-@app.post("/api/mkdir")
-def create_directory(parent_path: str = Form(...), name: str = Form(...)):
-    target = os.path.join(parent_path, name.strip())
-    if os.path.exists(target):
-        raise HTTPException(status_code=400, detail="Uma pasta ou arquivo com este nome já existe")
-    try:
-        os.makedirs(target, exist_ok=True)
-        return {"success": True, "path": target}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao criar pasta: {str(e)}")
+        if "application/json" in content_type:
+            return json.loads(post_data.decode("utf-8"))
+        elif "multipart/form-data" in content_type:
+            boundary = content_type.split("boundary=")[-1].strip().encode()
+            parts = post_data.split(b"--" + boundary)
+            fields = {}
+            for part in parts:
+                if b'name="' in part:
+                    header, _, body = part.partition(b"\r\n\r\n")
+                    body = body.rstrip(b"\r\n")
+                    name_match = re.search(rb'name="([^"]+)"', header)
+                    if name_match:
+                        name = name_match.group(1).decode("utf-8")
+                        fields[name] = body.decode("utf-8", errors="replace")
+            return fields
+        else:
+            parsed = urllib.parse.parse_qs(post_data.decode("utf-8"))
+            return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
 
+    def handle_multipart_upload(self):
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", 0))
+        boundary = content_type.split("boundary=")[-1].strip().encode()
 
-@app.post("/api/rename")
-def rename_item(old_path: str = Form(...), new_name: str = Form(...)):
-    if not os.path.exists(old_path):
-        raise HTTPException(status_code=404, detail="Arquivo/pasta não encontrado")
-    
-    parent = os.path.dirname(old_path)
-    target = os.path.join(parent, new_name.strip())
-    if os.path.exists(target):
-        raise HTTPException(status_code=400, detail="Já existe um item com este novo nome")
-        
-    try:
-        os.rename(old_path, target)
-        return {"success": True, "path": target}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao renomear: {str(e)}")
+        data = self.rfile.read(content_length)
+        parts = data.split(b"--" + boundary)
+        target_path = None
+        saved_files = []
 
+        for part in parts:
+            if b'name="target_path"' in part:
+                _, _, body = part.partition(b"\r\n\r\n")
+                target_path = body.rstrip(b"\r\n").decode("utf-8", errors="replace").strip()
+                break
 
-@app.post("/api/delete")
-def delete_items(paths: List[str] = Form(...)):
-    deleted = []
-    errors = []
-    for path in paths:
+        if not target_path or not os.path.exists(target_path):
+            self.send_json({"detail": "Diretório de destino inválido"}, 400)
+            return
+
+        for part in parts:
+            if b'filename="' in part:
+                header, _, body = part.partition(b"\r\n\r\n")
+                body = body.rstrip(b"\r\n")
+                match = re.search(rb'filename="([^"]+)"', header)
+                if match:
+                    filename = match.group(1).decode("utf-8", errors="replace").strip()
+                    if filename:
+                        dest = os.path.join(target_path, filename)
+                        with open(dest, "wb") as f:
+                            f.write(body)
+                        saved_files.append(filename)
+
+        self.send_json({"success": True, "saved": saved_files})
+
+    def serve_static(self, filepath, mime):
+        with open(filepath, "rb") as f:
+            content = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def serve_folder_zip(self, dir_path):
+        folder_name = os.path.basename(os.path.abspath(dir_path)) or "download"
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
         try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.exists(path):
-                os.remove(path)
-            deleted.append(path)
-        except Exception as e:
-            errors.append({"path": path, "error": str(e)})
-
-    return {"deleted": deleted, "errors": errors}
-
-
-@app.post("/api/upload")
-async def upload_files(
-    target_path: str = Form(...),
-    files: List[UploadFile] = File(...)
-):
-    if not os.path.exists(target_path) or not os.path.isdir(target_path):
-        raise HTTPException(status_code=400, detail="Diretório de destino inválido")
-
-    saved_files = []
-    for upload in files:
-        file_path = os.path.join(target_path, upload.filename)
-        # Handle duplicates if needed or overwrite
-        try:
-            with open(file_path, "wb") as buffer:
-                while chunk := await upload.read(1024 * 1024):  # 1MB chunks
-                    buffer.write(chunk)
-            saved_files.append(upload.filename)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao salvar {upload.filename}: {str(e)}")
+            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(dir_path):
+                    for file in files:
+                        file_abs = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_abs, dir_path)
+                        zipf.write(file_abs, arcname=rel_path)
             
-    return {"success": True, "saved": saved_files}
+            size = os.path.getsize(temp_zip.name)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{folder_name}.zip"')
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
 
+            with open(temp_zip.name, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        finally:
+            if os.path.exists(temp_zip.name):
+                try:
+                    os.remove(temp_zip.name)
+                except Exception:
+                    pass
 
-@app.get("/api/download-zip")
-def download_folder_zip(path: str = Query(...)):
-    if not os.path.exists(path) or not os.path.isdir(path):
-        raise HTTPException(status_code=404, detail="Diretório não encontrado")
+    def serve_file_with_range(self, file_path):
+        file_size = os.path.getsize(file_path)
+        mime, _ = mimetypes.guess_type(file_path)
+        mime = mime or "application/octet-stream"
+        filename = os.path.basename(file_path)
 
-    folder_name = os.path.basename(os.path.abspath(path)) or "download"
-    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    
-    try:
-        with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    file_abs = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_abs, path)
-                    zipf.write(file_abs, arcname=rel_path)
-        
-        return FileResponse(
-            temp_zip.name,
-            media_type="application/zip",
-            filename=f"{folder_name}.zip"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao compactar: {str(e)}")
-
-
-# Streaming endpoint with full HTTP Range support for video & audio playback
-@app.get("/api/stream")
-def stream_file(request: Request, path: str = Query(...)):
-    if not os.path.exists(path) or os.path.isdir(path):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-
-    file_size = os.path.getsize(path)
-    mime_type, _ = mimetypes.guess_type(path)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
-    range_header = request.headers.get("range")
-    if range_header:
-        range_value = range_header.strip().lower()
-        if range_value.startswith("bytes="):
-            parts = range_value[6:].split("-")
+        range_header = self.headers.get("Range")
+        if range_header and range_header.startswith("bytes="):
+            parts = range_header[6:].split("-")
             start = int(parts[0]) if parts[0] else 0
             end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
             start = max(0, start)
             end = min(file_size - 1, end)
             length = end - start + 1
 
-            def iterfile():
-                with open(path, "rb") as f:
-                    f.seek(start)
-                    bytes_left = length
-                    while bytes_left > 0:
-                        chunk_size = min(64 * 1024, bytes_left)
-                        data = f.read(chunk_size)
-                        if not data:
-                            break
-                        bytes_left -= len(data)
-                        yield data
+            self.send_response(206)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
 
-            headers = {
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(length),
-                "Content-Type": mime_type,
-            }
-            return StreamingResponse(iterfile(), status_code=206, headers=headers)
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                bytes_left = length
+                while bytes_left > 0:
+                    chunk = f.read(min(64 * 1024, bytes_left))
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    bytes_left -= len(chunk)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+            self.end_headers()
 
-    # Full file response if no range header
-    return FileResponse(
-        path,
-        media_type=mime_type,
-        filename=os.path.basename(path),
-        headers={"Accept-Ranges": "bytes"}
-    )
+            with open(file_path, "rb") as f:
+                while chunk := f.read(64 * 1024):
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
 
 
-@app.get("/api/text-content")
-def get_text_content(path: str = Query(...)):
-    if not os.path.exists(path) or os.path.isdir(path):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-    
-    # Max 5MB for text preview
-    if os.path.getsize(path) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Arquivo muito grande para visualização de texto (>5MB)")
-
+def run():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), NASRequestHandler)
+    print(f"[*] Servidor NAS Nativo iniciado em http://0.0.0.0:{PORT}")
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        return {"content": content, "filename": os.path.basename(path)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {str(e)}")
-
-
-# Mount Static Files (SPA Web Interface)
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.exists(static_dir):
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-
-@app.get("/")
-def serve_index():
-    index_file = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {"message": "Android NAS API is running. static/index.html not found."}
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] Servidor encerrado.")
+        server.server_close()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    # Default port 8080 or custom port
-    port = int(os.environ.get("PORT", 8080))
-    print(f"[*] Iniciando Android Tablet NAS em http://0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    run()
+EOF
