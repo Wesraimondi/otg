@@ -6,7 +6,12 @@ import zipfile
 import tempfile
 from typing import List, Optional
 from pathlib import Path
-import psutil
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -112,23 +117,24 @@ def get_storage_drives():
 
     # 5. Fallback for Windows / Linux Desktop development & testing
     if not drives:
-        for part in psutil.disk_partitions(all=False):
-            try:
-                if 'cdrom' in part.opts or part.fstype == '':
+        if HAS_PSUTIL:
+            for part in psutil.disk_partitions(all=False):
+                try:
+                    if 'cdrom' in part.opts or part.fstype == '':
+                        continue
+                    usage = psutil.disk_usage(part.mountpoint)
+                    drives.append({
+                        "id": f"drive_{part.mountpoint.replace(':', '').replace('\\\\', '').replace('/', '')}",
+                        "name": f"Unidade ({part.mountpoint})",
+                        "path": part.mountpoint,
+                        "type": "fixed",
+                        "total": usage.total,
+                        "used": usage.used,
+                        "free": usage.free,
+                        "percent": usage.percent
+                    })
+                except Exception:
                     continue
-                usage = psutil.disk_usage(part.mountpoint)
-                drives.append({
-                    "id": f"drive_{part.mountpoint.replace(':', '').replace('\\', '').replace('/', '')}",
-                    "name": f"Unidade ({part.mountpoint})",
-                    "path": part.mountpoint,
-                    "type": "fixed",
-                    "total": usage.total,
-                    "used": usage.used,
-                    "free": usage.free,
-                    "percent": usage.percent
-                })
-            except Exception:
-                continue
 
     # 6. Fallback to current working dir if still empty
     if not drives:
@@ -179,19 +185,20 @@ def api_get_drives():
 def api_get_system_status():
     battery_info = {"percent": None, "charging": False, "present": False}
     
-    # Check psutil battery
-    try:
-        batt = psutil.sensors_battery()
-        if batt is not None:
-            battery_info = {
-                "percent": int(batt.percent),
-                "charging": batt.power_plugged,
-                "present": True
-            }
-    except Exception:
-        pass
+    # Check psutil battery if available
+    if HAS_PSUTIL:
+        try:
+            batt = psutil.sensors_battery()
+            if batt is not None:
+                battery_info = {
+                    "percent": int(batt.percent),
+                    "charging": batt.power_plugged,
+                    "present": True
+                }
+        except Exception:
+            pass
 
-    # If psutil failed, try reading Android /sys/class/power_supply/battery
+    # Android /sys/class/power_supply/battery (Linux standard)
     if not battery_info["present"]:
         try:
             capacity_path = "/sys/class/power_supply/battery/capacity"
@@ -212,18 +219,47 @@ def api_get_system_status():
         except Exception:
             pass
 
-    # RAM and CPU
-    mem = psutil.virtual_memory()
-    cpu_usage = psutil.cpu_percent(interval=None)
+    # RAM calculation
+    mem_info = {"total": 0, "used": 0, "free": 0, "percent": 0}
+    if HAS_PSUTIL:
+        try:
+            mem = psutil.virtual_memory()
+            mem_info = {
+                "total": mem.total,
+                "used": mem.used,
+                "free": mem.available,
+                "percent": mem.percent
+            }
+        except Exception:
+            pass
+    elif os.path.exists("/proc/meminfo"):
+        try:
+            mem_dict = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val = int(parts[1].split()[0]) * 1024
+                        mem_dict[key] = val
+            total = mem_dict.get("MemTotal", 0)
+            avail = mem_dict.get("MemAvailable", mem_dict.get("MemFree", 0))
+            used = total - avail
+            percent = round((used / total) * 100, 1) if total > 0 else 0
+            mem_info = {"total": total, "used": used, "free": avail, "percent": percent}
+        except Exception:
+            pass
+
+    cpu_usage = 0
+    if HAS_PSUTIL:
+        try:
+            cpu_usage = psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
 
     return {
         "battery": battery_info,
-        "memory": {
-            "total": mem.total,
-            "used": mem.used,
-            "free": mem.available,
-            "percent": mem.percent
-        },
+        "memory": mem_info,
         "cpu_percent": cpu_usage,
         "drives": get_storage_drives()
     }
