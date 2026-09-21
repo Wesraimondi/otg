@@ -14,14 +14,13 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", 8080))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_drives.json")
 
-# Credenciais Padrão do NAS
 AUTH_USER = os.environ.get("NAS_USER", "Wesley")
 AUTH_PASS = os.environ.get("NAS_PASS", "210769")
 
-# Armazenamento de Sessões Ativas (Token -> Timestamp de expiração)
 ACTIVE_SESSIONS = {}
-SESSION_EXPIRY = 7 * 24 * 3600  # 7 dias
+SESSION_EXPIRY = 7 * 24 * 3600
 
 
 def is_valid_token(token):
@@ -35,106 +34,132 @@ def is_valid_token(token):
     return False
 
 
+def load_custom_drives():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_custom_drive(name, path):
+    drives = load_custom_drives()
+    if not any(d["path"] == path for d in drives):
+        drives.append({"name": name, "path": path})
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(drives, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
 def get_storage_drives():
     drives = []
+    seen_paths = set()
 
-    # 1. Armazenamento Interno do Android
-    android_internal = "/storage/emulated/0"
-    if os.path.exists(android_internal):
+    def add_drive(drive_id, name, path, drive_type):
+        if not path or not os.path.exists(path):
+            return
+        real_path = os.path.realpath(path)
+        if real_path in seen_paths:
+            return
         try:
-            u = shutil.disk_usage(android_internal)
+            usage = shutil.disk_usage(real_path)
+            seen_paths.add(real_path)
             drives.append({
-                "id": "internal",
-                "name": "Armazenamento Interno",
-                "path": android_internal,
-                "type": "internal",
-                "total": u.total,
-                "used": u.used,
-                "free": u.free,
-                "percent": round((u.used / u.total) * 100, 1) if u.total > 0 else 0
+                "id": drive_id,
+                "name": name,
+                "path": real_path,
+                "type": drive_type,
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                "percent": round((usage.used / usage.total) * 100, 1) if usage.total > 0 else 0
             })
         except Exception:
             pass
 
-    # 2. USB OTG / SD Cards em /storage
-    if os.path.exists("/storage"):
+    # 1. Armazenamento Interno Padrão
+    add_drive("internal", "Armazenamento Interno", "/storage/emulated/0", "internal")
+
+    # 2. Caminhos Especiais em Português / Samsung / Xiaomi (ex: /armazenamento usb 1)
+    pt_candidates = [
+        "/armazenamento usb 1",
+        "/Armazenamento USB 1",
+        "/armazenamento usb",
+        "/Armazenamento USB",
+        "/storage/armazenamento usb 1",
+        "/storage/Armazenamento USB 1",
+        "/mnt/armazenamento usb 1",
+        "/mnt/Armazenamento USB 1",
+        "/mnt/usb_storage",
+        "/mnt/usb1",
+        "/mnt/media_rw"
+    ]
+    for cand in pt_candidates:
+        if os.path.exists(cand):
+            add_drive(f"cand_{cand}", f"USB OTG ({os.path.basename(cand)})", cand, "otg")
+
+    # 3. Varredura na Raiz / procurando por pastas de armazenamento USB
+    try:
+        for root_item in os.listdir("/"):
+            if any(k in root_item.lower() for k in ["usb", "armazenamento", "otg", "pendrive"]):
+                full_p = os.path.join("/", root_item)
+                add_drive(f"root_{root_item}", f"USB Drive ({root_item})", full_p, "otg")
+    except Exception:
+        pass
+
+    # 4. Termux Storage (~/storage/external-*)
+    termux_storage = os.path.expanduser("~/storage")
+    if os.path.exists(termux_storage):
         try:
-            for item in os.listdir("/storage"):
-                if item not in ["emulated", "self", "knox", "container"]:
-                    p = os.path.join("/storage", item)
-                    if os.path.isdir(p) and os.access(p, os.R_OK):
-                        try:
-                            u = shutil.disk_usage(p)
-                            drives.append({
-                                "id": f"otg_{item}",
-                                "name": f"USB OTG / Drive ({item})",
-                                "path": p,
-                                "type": "otg",
-                                "total": u.total,
-                                "used": u.used,
-                                "free": u.free,
-                                "percent": round((u.used / u.total) * 100, 1) if u.total > 0 else 0
-                            })
-                        except Exception:
-                            pass
+            for item in os.listdir(termux_storage):
+                item_path = os.path.join(termux_storage, item)
+                if item.startswith("external"):
+                    target = os.path.realpath(item_path)
+                    add_drive(f"termux_{item}", f"USB OTG ({os.path.basename(target)})", target, "otg")
         except Exception:
             pass
 
-    # 3. /mnt/media_rw para HDs externos
-    if os.path.exists("/mnt/media_rw"):
+    # 5. Varredura /proc/mounts
+    if os.path.exists("/proc/mounts"):
         try:
-            for item in os.listdir("/mnt/media_rw"):
-                p = os.path.join("/mnt/media_rw", item)
-                if os.path.isdir(p) and not any(d["path"] == p for d in drives):
-                    try:
-                        u = shutil.disk_usage(p)
-                        drives.append({
-                            "id": f"media_rw_{item}",
-                            "name": f"USB HD OTG ({item})",
-                            "path": p,
-                            "type": "otg",
-                            "total": u.total,
-                            "used": u.used,
-                            "free": u.free,
-                            "percent": round((u.used / u.total) * 100, 1) if u.total > 0 else 0
-                        })
-                    except Exception:
-                        pass
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mp = parts[1]
+                        if mp.startswith("/storage/") and not any(x in mp for x in ["/emulated", "/self", "/knox"]):
+                            add_drive(f"mount_{os.path.basename(mp)}", f"USB OTG ({os.path.basename(mp)})", mp, "otg")
+                        elif mp.startswith("/mnt/media_rw/") or mp.startswith("/mnt/pass_through/"):
+                            add_drive(f"mnt_{os.path.basename(mp)}", f"USB HD OTG ({os.path.basename(mp)})", mp, "otg")
+                        elif any(k in mp.lower() for k in ["usb", "armazenamento"]):
+                            add_drive(f"mount_kw_{os.path.basename(mp)}", f"USB Drive ({os.path.basename(mp)})", mp, "otg")
         except Exception:
             pass
 
-    # 4. Termux Home
+    # 6. Varredura /storage/ e /mnt/
+    for base_dir in ["/storage", "/mnt"]:
+        if os.path.exists(base_dir):
+            try:
+                for item in os.listdir(base_dir):
+                    if item not in ["emulated", "self", "knox", "container", "asec", "obb"]:
+                        full_p = os.path.join(base_dir, item)
+                        if os.path.isdir(full_p):
+                            add_drive(f"base_{item}", f"USB OTG ({item})", full_p, "otg")
+            except Exception:
+                pass
+
+    # 7. Unidades Salvas pelo Usuário
+    for custom in load_custom_drives():
+        add_drive(f"custom_{custom['path']}", custom['name'], custom['path'], "otg")
+
+    # 8. Termux Home
     home = os.environ.get("HOME", "/data/data/com.termux/files/home")
-    if os.path.exists(home) and not any(d["path"] == home for d in drives):
-        try:
-            u = shutil.disk_usage(home)
-            drives.append({
-                "id": "home",
-                "name": "Termux Home",
-                "path": home,
-                "type": "home",
-                "total": u.total,
-                "used": u.used,
-                "free": u.free,
-                "percent": round((u.used / u.total) * 100, 1) if u.total > 0 else 0
-            })
-        except Exception:
-            pass
-
-    # 5. Fallback para diretório atual
-    if not drives:
-        cwd = os.getcwd()
-        u = shutil.disk_usage(cwd)
-        drives.append({
-            "id": "default",
-            "name": "Diretório Principal",
-            "path": cwd,
-            "type": "fixed",
-            "total": u.total,
-            "used": u.used,
-            "free": u.free,
-            "percent": round((u.used / u.total) * 100, 1) if u.total > 0 else 0
-        })
+    if os.path.exists(home) and home not in seen_paths:
+        add_drive("home", "Termux Home", home, "home")
 
     return drives
 
@@ -153,7 +178,7 @@ def get_file_category(filename: str, is_dir: bool) -> str:
         return "pdf"
     elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.apk', '.iso']:
         return "archive"
-    elif ext in ['.txt', '.md', '.log', '.json', '.xml', '.html', '.css', '.js', '.py', '.sh', '.yaml', '.yml', '.csv', '.c', '.cpp', '.java']:
+    elif ext in ['.txt', '.md', '.log', '.json', '.xml', '.html', '.css', '.js', '.py', '.sh', '.yaml', '.yml', '.csv']:
         return "code"
     elif ext in ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods']:
         return "document"
@@ -190,7 +215,7 @@ def get_system_status():
                 "total": t,
                 "used": used,
                 "free": av,
-                "percent": round((used / t) * 100, 1) if t > 0 else 0
+                "percent": round(((t - av) / t) * 100, 1) if t > 0 else 0
             }
         except Exception:
             pass
@@ -199,32 +224,26 @@ def get_system_status():
         "user": AUTH_USER,
         "battery": battery_info,
         "memory": mem_info,
-        "uptime": time.time(),
         "drives": get_storage_drives()
     }
 
 
 class NASRequestHandler(BaseHTTPRequestHandler):
     def get_token(self):
-        # 1. Header Authorization: Bearer <token>
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:].strip()
-        # 2. Query param ?token=<token>
-        parsed = urllib.parse.urlparse(self.path)
-        q = urllib.parse.parse_qs(parsed.query)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         if "token" in q:
             return q["token"][0]
-        # 3. Cookie
-        cookie_header = self.headers.get("Cookie", "")
-        for c in cookie_header.split(";"):
+        cookie = self.headers.get("Cookie", "")
+        for c in cookie.split(";"):
             if "nas_token=" in c:
                 return c.split("nas_token=")[-1].strip()
         return None
 
     def is_authenticated(self):
-        token = self.get_token()
-        return is_valid_token(token)
+        return is_valid_token(self.get_token())
 
     def send_json(self, data, status_code=200):
         body = json.dumps(data).encode("utf-8")
@@ -244,10 +263,8 @@ class NASRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         pr = urllib.parse.urlparse(self.path)
-        path = pr.path
-        query = urllib.parse.parse_qs(pr.query)
+        path, query = pr.path, urllib.parse.parse_qs(pr.query)
 
-        # 1. Rotas públicas (Interface estática)
         if path in ["/", "/index.html"]:
             idx = os.path.join(STATIC_DIR, "index.html")
             if os.path.exists(idx):
@@ -262,22 +279,6 @@ class NASRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Index not found"}, 404)
             return
 
-        if path.startswith("/static/"):
-            fp = os.path.join(STATIC_DIR, path[8:])
-            if os.path.exists(fp) and os.path.isfile(fp):
-                mime, _ = mimetypes.guess_type(fp)
-                with open(fp, "rb") as f:
-                    ct = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", mime or "application/octet-stream")
-                self.send_header("Content-Length", str(len(ct)))
-                self.end_headers()
-                self.wfile.write(ct)
-            else:
-                self.send_json({"error": "Static not found"}, 404)
-            return
-
-        # 2. Rota de verificação de autenticação
         if path == "/api/check-auth":
             if self.is_authenticated():
                 self.send_json({"authenticated": True, "user": AUTH_USER})
@@ -285,22 +286,18 @@ class NASRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"authenticated": False}, 401)
             return
 
-        # 3. Proteção das APIs com autenticação
         if not self.is_authenticated():
-            self.send_json({"detail": "Não autorizado. Faça login primeiro."}, 401)
+            self.send_json({"detail": "Não autorizado"}, 401)
             return
 
-        # 4. APIs Protegidas do NAS
         if path == "/api/drives":
             return self.send_json(get_storage_drives())
-
         if path == "/api/system-status":
             return self.send_json(get_system_status())
-
         if path == "/api/files":
             dp = query.get("path", [""])[0]
             if not dp or not os.path.exists(dp):
-                return self.send_json({"detail": "Diretório não encontrado"}, 404)
+                return self.send_json({"detail": "Não encontrado"}, 404)
             try:
                 items = []
                 with os.scandir(dp) as sc:
@@ -330,33 +327,19 @@ class NASRequestHandler(BaseHTTPRequestHandler):
                 })
             except Exception as e:
                 return self.send_json({"detail": str(e)}, 500)
-
         if path == "/api/stream":
             fp = query.get("path", [""])[0]
             if not fp or not os.path.exists(fp) or os.path.isdir(fp):
-                return self.send_json({"detail": "Arquivo não encontrado"}, 404)
+                return self.send_json({"detail": "Não encontrado"}, 404)
             self.serve_file_with_range(fp)
             return
-
         if path == "/api/download-zip":
             dp = query.get("path", [""])[0]
             if not dp or not os.path.exists(dp):
-                return self.send_json({"detail": "Diretório não encontrado"}, 404)
+                return self.send_json({"detail": "Não encontrado"}, 404)
             self.serve_folder_zip(dp)
             return
-
-        if path == "/api/text-content":
-            fp = query.get("path", [""])[0]
-            if not fp or not os.path.exists(fp):
-                return self.send_json({"detail": "Arquivo não encontrado"}, 404)
-            try:
-                with open(fp, "r", encoding="utf-8", errors="replace") as f:
-                    ct = f.read(5 * 1024 * 1024)
-                return self.send_json({"content": ct, "filename": os.path.basename(fp)})
-            except Exception as e:
-                return self.send_json({"detail": str(e)}, 500)
-
-        self.send_json({"error": "Endpoint não encontrado"}, 404)
+        self.send_json({"error": "404"}, 404)
 
     def do_POST(self):
         pr = urllib.parse.urlparse(self.path)
@@ -365,82 +348,55 @@ class NASRequestHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(cl) if cl > 0 else b""
         ct = self.headers.get("Content-Type", "")
 
-        # 1. Login Endpoint (Público)
         if path == "/api/login":
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception:
                 data = self.parse_form_dict(raw, ct)
-            user = data.get("username", "").strip()
-            pwd = data.get("password", "").strip()
-
+            user, pwd = data.get("username", "").strip(), data.get("password", "").strip()
             if user == AUTH_USER and pwd == AUTH_PASS:
                 token = secrets.token_hex(24)
                 ACTIVE_SESSIONS[token] = time.time() + SESSION_EXPIRY
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Set-Cookie", f"nas_token={token}; Path=/; Max-Age={SESSION_EXPIRY}; SameSite=Lax")
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True, "token": token, "user": AUTH_USER}).encode("utf-8"))
-                return
             else:
-                return self.send_json({"success": False, "detail": "Usuário ou senha incorretos."}, 401)
+                self.send_json({"success": False, "detail": "Usuário ou senha incorretos."}, 401)
+            return
 
-        # 2. Logout Endpoint
         if path == "/api/logout":
             token = self.get_token()
             if token in ACTIVE_SESSIONS:
                 del ACTIVE_SESSIONS[token]
-            self.send_response(200)
-            self.send_header("Set-Cookie", "nas_token=; Path=/; Max-Age=0")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(b'{"success": true}')
+            self.send_json({"success": True})
             return
 
-        # 3. Proteção das demais APIs POST
         if not self.is_authenticated():
             return self.send_json({"detail": "Não autorizado"}, 401)
 
+        # Adicionar Caminho Customizado / Manual de OTG
+        if path == "/api/add-custom-drive":
+            params = self.parse_form_dict(raw, ct)
+            d_path = params.get("path", "").strip()
+            d_name = params.get("name", "").strip() or f"USB ({os.path.basename(d_path)})"
+            if d_path and os.path.exists(d_path):
+                save_custom_drive(d_name, d_path)
+                return self.send_json({"success": True, "drives": get_storage_drives()})
+            return self.send_json({"detail": f"O caminho '{d_path}' não foi encontrado no sistema."}, 400)
+
         if path == "/api/mkdir":
             params = self.parse_form_dict(raw, ct)
-            parent = params.get("parent_path", "")
-            name = params.get("name", "").strip()
+            parent, name = params.get("parent_path", ""), params.get("name", "").strip()
             if parent and name:
                 os.makedirs(os.path.join(parent, name), exist_ok=True)
                 return self.send_json({"success": True})
             return self.send_json({"detail": "Parâmetros inválidos"}, 400)
-
-        if path == "/api/rename":
-            params = self.parse_form_dict(raw, ct)
-            old_p = params.get("old_path", "")
-            new_n = params.get("new_name", "").strip()
-            if old_p and new_n and os.path.exists(old_p):
-                os.rename(old_p, os.path.join(os.path.dirname(old_p), new_n))
-                return self.send_json({"success": True})
-            return self.send_json({"detail": "Item não encontrado"}, 404)
-
-        if path == "/api/delete":
-            params = self.parse_form_dict(raw, ct)
-            paths = params.get("paths", [])
-            if isinstance(paths, str):
-                paths = [paths]
-            for itm in paths:
-                try:
-                    if os.path.isdir(itm):
-                        shutil.rmtree(itm)
-                    elif os.path.exists(itm):
-                        os.remove(itm)
-                except Exception:
-                    pass
-            return self.send_json({"deleted": paths})
-
         if path == "/api/upload":
             bd = ct.split("boundary=")[-1].strip().encode()
             parts = raw.split(b"--" + bd)
             target = None
-            saved = []
             for pt in parts:
                 if b'name="target_path"' in pt:
                     target = pt.partition(b"\r\n\r\n")[2].rstrip(b"\r\n").decode("utf-8", errors="replace").strip()
@@ -455,10 +411,8 @@ class NASRequestHandler(BaseHTTPRequestHandler):
                             if fn:
                                 with open(os.path.join(target, fn), "wb") as f:
                                     f.write(bdy.rstrip(b"\r\n"))
-                                saved.append(fn)
-            return self.send_json({"success": True, "saved": saved})
-
-        self.send_json({"error": "Endpoint não encontrado"}, 404)
+            return self.send_json({"success": True})
+        self.send_json({"error": "404"}, 404)
 
     def parse_form_dict(self, raw, ct):
         if "multipart" in ct:
@@ -476,45 +430,44 @@ class NASRequestHandler(BaseHTTPRequestHandler):
         return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
 
     def serve_folder_zip(self, dir_path):
-        folder_name = os.path.basename(os.path.abspath(dir_path)) or "download"
-        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        fn = os.path.basename(os.path.abspath(dir_path)) or "download"
+        tz = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
         try:
-            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(tz.name, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for r, d, fls in os.walk(dir_path):
                     for file in fls:
                         fa = os.path.join(r, file)
                         zf.write(fa, arcname=os.path.relpath(fa, dir_path))
-            sz = os.path.getsize(temp_zip.name)
+            sz = os.path.getsize(tz.name)
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", f'attachment; filename="{folder_name}.zip"')
+            self.send_header("Content-Disposition", f'attachment; filename="{fn}.zip"')
             self.send_header("Content-Length", str(sz))
             self.end_headers()
-            with open(temp_zip.name, "rb") as f:
+            with open(tz.name, "rb") as f:
                 shutil.copyfileobj(f, self.wfile)
         finally:
-            if os.path.exists(temp_zip.name):
+            if os.path.exists(tz.name):
                 try:
-                    os.remove(temp_zip.name)
+                    os.remove(tz.name)
                 except Exception:
                     pass
 
     def serve_file_with_range(self, file_path):
-        file_size = os.path.getsize(file_path)
+        sz = os.path.getsize(file_path)
         mime, _ = mimetypes.guess_type(file_path)
         mime = mime or "application/octet-stream"
-        filename = os.path.basename(file_path)
-
+        fn = os.path.basename(file_path)
         rng = self.headers.get("Range")
         if rng and rng.startswith("bytes="):
             parts = rng[6:].split("-")
             s = int(parts[0]) if parts[0] else 0
-            e = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-            s, e = max(0, s), min(file_size - 1, e)
+            e = int(parts[1]) if len(parts) > 1 and parts[1] else sz - 1
+            s, e = max(0, s), min(sz - 1, e)
             l = e - s + 1
             self.send_response(206)
             self.send_header("Content-Type", mime)
-            self.send_header("Content-Range", f"bytes {s}-{e}/{file_size}")
+            self.send_header("Content-Range", f"bytes {s}-{e}/{sz}")
             self.send_header("Content-Length", str(l))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
@@ -533,9 +486,9 @@ class NASRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(200)
             self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Length", str(sz))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+            self.send_header("Content-Disposition", f'inline; filename="{fn}"')
             self.end_headers()
             with open(file_path, "rb") as f:
                 while ck := f.read(64 * 1024):
@@ -545,7 +498,7 @@ class NASRequestHandler(BaseHTTPRequestHandler):
                         break
 
 
-def run():
+if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", PORT), NASRequestHandler)
     print("==========================================================")
     print("       🛡️  SISTEMA NAS PROFISSIONAL ANDROID (OTG)         ")
@@ -557,9 +510,4 @@ def run():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[*] Servidor encerrado.")
         server.server_close()
-
-
-if __name__ == "__main__":
-    run()

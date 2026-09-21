@@ -7,7 +7,7 @@
 
 clear
 echo -e "\033[1;36m========================================================\033[0m"
-echo -e "\033[1;32m   🛡️  INSTALANDO WESLEY NAS OS (PROFISSIONAL + OTG)    \033[0m"
+echo -e "\033[1;32m   🛡️  ATUALIZANDO WESLEY NAS OS (DETECÇÃO OTG PT-BR)  \033[0m"
 echo -e "\033[1;36m========================================================\033[0m"
 
 # 1. Permissões de Armazenamento e Wake-Lock
@@ -118,7 +118,13 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
     <div class="flex-1 flex overflow-hidden">
       <aside class="w-72 bg-slate-900 border-r border-slate-800 flex flex-col">
         <div class="p-4 border-b border-slate-800">
-          <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-2.5">Armazenamento</span>
+          <div class="flex items-center justify-between mb-2.5">
+            <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Armazenamento</span>
+            <button onclick="promptAddCustomDrive()" title="Adicionar Caminho OTG Manual" class="text-brand-400 hover:text-white text-xs font-bold flex items-center gap-1">
+              <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+              <span>Caminho</span>
+            </button>
+          </div>
           <div id="sidebarDrives" class="space-y-2"></div>
         </div>
         <div class="flex-1 p-4 overflow-y-auto space-y-1">
@@ -242,6 +248,17 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 
     function selectDrive(path, driveObj) { currentActiveDrive = driveObj || { path }; loadFolder(path); }
 
+    async function promptAddCustomDrive() {
+      const p = prompt("Digite o caminho da unidade OTG (ex: /armazenamento usb 1):", "/armazenamento usb 1");
+      if(!p || !p.trim()) return;
+      const fd = new FormData();
+      fd.append("path", p.trim());
+      fd.append("name", "USB OTG");
+      const res = await fetch('/api/add-custom-drive', { method: 'POST', headers: authHeaders(), body: fd });
+      const data = await res.json();
+      if(res.ok) { fetchSystemTelemetry(); } else { alert(data.detail || "Caminho não encontrado no dispositivo."); }
+    }
+
     async function loadFolder(path) {
       try {
         const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`, { headers: authHeaders() });
@@ -332,7 +349,7 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 HTMLEOF
 
 # 4. Criar backend Python app.py
-echo -e "\033[1;33m[4/4] Configurando backend Python com autenticação...\033[0m"
+echo -e "\033[1;33m[4/4] Configurando backend Python com suporte a caminhos PT-BR...\033[0m"
 cat << 'PYEOF' > "$DIR_BASE/app.py"
 #!/usr/bin/env python3
 import os, sys, json, shutil, urllib.parse, mimetypes, zipfile, tempfile, re, secrets, time
@@ -340,6 +357,7 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", 8080))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_drives.json")
 
 AUTH_USER = os.environ.get("NAS_USER", "Wesley")
 AUTH_PASS = os.environ.get("NAS_PASS", "210769")
@@ -354,49 +372,96 @@ def is_valid_token(token):
         else: del ACTIVE_SESSIONS[token]
     return False
 
+def load_custom_drives():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception: return []
+    return []
+
+def save_custom_drive(name, path):
+    drives = load_custom_drives()
+    if not any(d["path"] == path for d in drives):
+        drives.append({"name": name, "path": path})
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(drives, f, ensure_ascii=False, indent=2)
+        except Exception: pass
+
 def get_storage_drives():
     drives = []
-    android_internal = "/storage/emulated/0"
-    if os.path.exists(android_internal):
+    seen_paths = set()
+
+    def add_drive(drive_id, name, path, drive_type):
+        if not path or not os.path.exists(path): return
+        real_path = os.path.realpath(path)
+        if real_path in seen_paths: return
         try:
-            u = shutil.disk_usage(android_internal)
-            drives.append({"id": "internal", "name": "Armazenamento Interno", "path": android_internal, "type": "internal", "total": u.total, "used": u.used, "free": u.free, "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0})
+            u = shutil.disk_usage(real_path)
+            seen_paths.add(real_path)
+            drives.append({
+                "id": drive_id, "name": name, "path": real_path, "type": drive_type,
+                "total": u.total, "used": u.used, "free": u.free,
+                "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0
+            })
         except Exception: pass
 
-    if os.path.exists("/storage"):
+    # 1. Armazenamento Interno
+    add_drive("internal", "Armazenamento Interno", "/storage/emulated/0", "internal")
+
+    # 2. Caminhos em Português / Samsung / Xiaomi
+    for cand in ["/armazenamento usb 1", "/Armazenamento USB 1", "/armazenamento usb", "/storage/armazenamento usb 1", "/mnt/armazenamento usb 1", "/mnt/usb_storage", "/mnt/usb1"]:
+        if os.path.exists(cand): add_drive(f"cand_{cand}", f"USB OTG ({os.path.basename(cand)})", cand, "otg")
+
+    # 3. Raiz do Sistema
+    try:
+        for r_item in os.listdir("/"):
+            if any(k in r_item.lower() for k in ["usb", "armazenamento", "otg", "pendrive"]):
+                full_p = os.path.join("/", r_item)
+                add_drive(f"root_{r_item}", f"USB Drive ({r_item})", full_p, "otg")
+    except Exception: pass
+
+    # 4. Termux Storage
+    termux_storage = os.path.expanduser("~/storage")
+    if os.path.exists(termux_storage):
         try:
-            for item in os.listdir("/storage"):
-                if item not in ["emulated", "self", "knox", "container"]:
-                    p = os.path.join("/storage", item)
-                    if os.path.isdir(p) and os.access(p, os.R_OK):
-                        try:
-                            u = shutil.disk_usage(p)
-                            drives.append({"id": f"otg_{item}", "name": f"USB OTG / SD ({item})", "path": p, "type": "otg", "total": u.total, "used": u.used, "free": u.free, "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0})
-                        except Exception: pass
+            for item in os.listdir(termux_storage):
+                if item.startswith("external"):
+                    target = os.path.realpath(os.path.join(termux_storage, item))
+                    add_drive(f"termux_{item}", f"USB OTG ({os.path.basename(target)})", target, "otg")
         except Exception: pass
 
-    if os.path.exists("/mnt/media_rw"):
+    # 5. Varredura /proc/mounts
+    if os.path.exists("/proc/mounts"):
         try:
-            for item in os.listdir("/mnt/media_rw"):
-                p = os.path.join("/mnt/media_rw", item)
-                if os.path.isdir(p) and not any(d["path"] == p for d in drives):
-                    try:
-                        u = shutil.disk_usage(p)
-                        drives.append({"id": f"media_rw_{item}", "name": f"USB HD OTG ({item})", "path": p, "type": "otg", "total": u.total, "used": u.used, "free": u.free, "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0})
-                    except Exception: pass
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mp = parts[1]
+                        if mp.startswith("/storage/") and not any(x in mp for x in ["/emulated", "/self", "/knox"]):
+                            add_drive(f"mount_{os.path.basename(mp)}", f"USB OTG ({os.path.basename(mp)})", mp, "otg")
+                        elif mp.startswith("/mnt/media_rw/") or any(k in mp.lower() for k in ["usb", "armazenamento"]):
+                            add_drive(f"mnt_{os.path.basename(mp)}", f"USB Drive OTG ({os.path.basename(mp)})", mp, "otg")
         except Exception: pass
 
+    # 6. Varredura /storage/ e /mnt/
+    for base_dir in ["/storage", "/mnt"]:
+        if os.path.exists(base_dir):
+            try:
+                for item in os.listdir(base_dir):
+                    if item not in ["emulated", "self", "knox", "container"]:
+                        full_p = os.path.join(base_dir, item)
+                        if os.path.isdir(full_p): add_drive(f"base_{item}", f"USB OTG ({item})", full_p, "otg")
+            except Exception: pass
+
+    # 7. Unidades Salvas Manualmente
+    for custom in load_custom_drives():
+        add_drive(f"custom_{custom['path']}", custom['name'], custom['path'], "otg")
+
+    # 8. Termux Home
     home = os.environ.get("HOME", "/data/data/com.termux/files/home")
-    if os.path.exists(home) and not any(d["path"] == home for d in drives):
-        try:
-            u = shutil.disk_usage(home)
-            drives.append({"id": "home", "name": "Termux Home", "path": home, "type": "home", "total": u.total, "used": u.used, "free": u.free, "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0})
-        except Exception: pass
-
-    if not drives:
-        cwd = os.getcwd()
-        u = shutil.disk_usage(cwd)
-        drives.append({"id": "default", "name": "Diretório Principal", "path": cwd, "type": "fixed", "total": u.total, "used": u.used, "free": u.free, "percent": round((u.used/u.total)*100, 1) if u.total>0 else 0})
+    if os.path.exists(home) and home not in seen_paths:
+        add_drive("home", "Termux Home", home, "home")
 
     return drives
 
@@ -549,6 +614,15 @@ class NASRequestHandler(BaseHTTPRequestHandler):
             return
 
         if not self.is_authenticated(): return self.send_json({"detail": "Não autorizado"}, 401)
+
+        if path == "/api/add-custom-drive":
+            params = self.parse_form_dict(raw, ct)
+            d_path = params.get("path", "").strip()
+            d_name = params.get("name", "").strip() or f"USB ({os.path.basename(d_path)})"
+            if d_path and os.path.exists(d_path):
+                save_custom_drive(d_name, d_path)
+                return self.send_json({"success": True, "drives": get_storage_drives()})
+            return self.send_json({"detail": f"O caminho '{d_path}' não foi encontrado."}, 400)
 
         if path == "/api/mkdir":
             params = self.parse_form_dict(raw, ct)
