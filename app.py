@@ -14,20 +14,12 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", 8080))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_drives.json")
 
 AUTH_USER = os.environ.get("NAS_USER", "Wesley")
 AUTH_PASS = os.environ.get("NAS_PASS", "210769")
 
 ACTIVE_SESSIONS = {}
 SESSION_EXPIRY = 7 * 24 * 3600
-
-# Lista de pastas e nomes de sistema do Android a IGNORAR
-SYSTEM_IGNORE_KEYWORDS = [
-    "adb", "mtp", "ptp", "cd-rom", "runtime", "appfuse", "expand", 
-    "media_rw", "self", "knox", "container", "asec", "obb", "secure",
-    "installer", "apex", "system", "vendor", "data", "cache", "proc", "sys", "dev"
-]
 
 
 def is_valid_token(token):
@@ -41,60 +33,27 @@ def is_valid_token(token):
     return False
 
 
-def load_custom_drives():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-
-def save_custom_drive(name, path):
-    drives = load_custom_drives()
-    if not any(d["path"] == path for d in drives):
-        drives.append({"name": name, "path": path})
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(drives, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-
 def get_storage_drives():
     drives = []
-    seen_devices = set()  # Deduplicar pelo ID físico do dispositivo (st_dev)
     seen_paths = set()
+    seen_devs = set()
 
     def add_drive(drive_id, name, path, drive_type):
-        if not path or not os.path.exists(path):
+        if not path:
             return
-        
         real_path = os.path.realpath(path)
-        base_name = os.path.basename(real_path).lower()
-
-        # Filtrar pastas virtuais do sistema Android
-        if any(base_name == kw or f"({kw})" in base_name for kw in SYSTEM_IGNORE_KEYWORDS):
+        if not os.path.exists(real_path) or real_path in seen_paths:
             return
-        if any(f"/{kw}" in real_path.lower() for kw in ["/runtime", "/appfuse", "/expand", "/dev/usb-ffs"]):
-            return
-
         try:
+            usage = shutil.disk_usage(real_path)
+            if usage.total < 100 * 1024 * 1024:  # Ignorar partições menores que 100MB
+                return
+
             stat = os.stat(real_path)
             dev_id = stat.st_dev
-            usage = shutil.disk_usage(real_path)
 
-            # Ignorar partições vazias (0 B) ou menores que 100MB (partições virtuais do kernel)
-            if usage.total < 100 * 1024 * 1024:
-                return
-
-            # Não duplicar o mesmo disco físico
-            if dev_id in seen_devices or real_path in seen_paths:
-                return
-
-            seen_devices.add(dev_id)
             seen_paths.add(real_path)
+            seen_devs.add(dev_id)
 
             drives.append({
                 "id": drive_id,
@@ -109,54 +68,60 @@ def get_storage_drives():
         except Exception:
             pass
 
-    # 1. Armazenamento Interno do Celular/Tablet
+    # 1. Armazenamento Interno
     add_drive("internal", "Armazenamento Interno", "/storage/emulated/0", "internal")
 
-    # 2. Termux Storage Framework (~/storage/external-*) -> Pega o OTG real sem duplicatas
-    termux_storage = os.path.expanduser("~/storage")
-    if os.path.exists(termux_storage):
-        try:
-            for item in os.listdir(termux_storage):
-                if item.startswith("external"):
-                    target = os.path.realpath(os.path.join(termux_storage, item))
-                    add_drive("usb_otg_main", "USB OTG (Pen Drive / HD)", target, "otg")
-        except Exception:
-            pass
-
-    # 3. Caminhos em Português / Samsung
-    for pt_cand in ["/armazenamento usb 1", "/Armazenamento USB 1", "/storage/armazenamento usb 1", "/mnt/armazenamento usb 1"]:
-        if os.path.exists(pt_cand):
-            add_drive("usb_pt_cand", "USB OTG (Pen Drive / HD)", pt_cand, "otg")
-
-    # 4. Varredura direta na pasta /storage/ (Padrão Android XXXX-XXXX)
-    if os.path.exists("/storage"):
-        try:
-            for item in os.listdir("/storage"):
-                if re.match(r'^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$', item) or "usb" in item.lower() or "armazenamento" in item.lower():
-                    full_p = os.path.join("/storage", item)
-                    if os.path.isdir(full_p):
-                        add_drive(f"storage_{item}", f"USB OTG ({item})", full_p, "otg")
-        except Exception:
-            pass
-
-    # 5. Varredura limpa em /proc/mounts (Apenas discos reais vfat/exfat/ntfs/fuseblk)
+    # 2. Varredura Inteligente do /proc/mounts (Detecta o seu HD vold/sdfat/exfat)
     if os.path.exists("/proc/mounts"):
         try:
             with open("/proc/mounts", "r") as f:
                 for line in f:
                     parts = line.split()
                     if len(parts) >= 3:
+                        dev = parts[0]
                         mp = parts[1]
                         fs = parts[2].lower()
-                        if (mp.startswith("/storage/") or mp.startswith("/mnt/media_rw/")) and not any(x in mp for x in ["/emulated", "/self", "/knox"]):
-                            if any(valid_fs in fs for valid_fs in ["vfat", "exfat", "ntfs", "fuse", "sdcardfs"]):
-                                add_drive(f"mount_{os.path.basename(mp)}", "USB OTG (Pen Drive / HD)", mp, "otg")
+
+                        # Detecta partições vold (ex: /dev/block/vold/public:8,2) ou exfat/sdfat/vfat/ntfs
+                        if "vold" in dev or any(x in fs for x in ["sdfat", "exfat", "vfat", "ntfs", "fuseblk"]):
+                            if not any(x in mp for x in ["/emulated", "/self", "/knox", "apex"]):
+                                uuid = os.path.basename(mp)
+                                # Tenta todos os caminhos onde o Android disponibiliza este HD
+                                candidate_paths = [
+                                    f"/storage/{uuid}",
+                                    f"/mnt/user/0/{uuid}",
+                                    f"/mnt/pass_through/0/{uuid}",
+                                    f"/mnt/runtime/default/{uuid}",
+                                    f"/mnt/media_rw/{uuid}",
+                                    mp
+                                ]
+                                for cand in candidate_paths:
+                                    if os.path.exists(cand):
+                                        add_drive(f"otg_{uuid}", f"HD Externo USB ({uuid})", cand, "otg")
+                                        break
         except Exception:
             pass
 
-    # 6. Unidades Salvas Manualmente
-    for custom in load_custom_drives():
-        add_drive(f"custom_{custom['path']}", custom['name'], custom['path'], "otg")
+    # 3. Varredura direta na pasta /storage
+    if os.path.exists("/storage"):
+        try:
+            for item in os.listdir("/storage"):
+                if re.match(r'^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$', item):
+                    p = os.path.join("/storage", item)
+                    add_drive(f"storage_{item}", f"HD Externo USB ({item})", p, "otg")
+        except Exception:
+            pass
+
+    # 4. Termux Storage
+    termux_storage = os.path.expanduser("~/storage")
+    if os.path.exists(termux_storage):
+        try:
+            for item in os.listdir(termux_storage):
+                if item.startswith("external"):
+                    target = os.path.realpath(os.path.join(termux_storage, item))
+                    add_drive("termux_ext", "HD Externo USB", target, "otg")
+        except Exception:
+            pass
 
     return drives
 

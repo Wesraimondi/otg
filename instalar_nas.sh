@@ -7,7 +7,7 @@
 
 clear
 echo -e "\033[1;36m========================================================\033[0m"
-echo -e "\033[1;32m   🛡️  WESLEY NAS OS (STATUS DE CÓPIA & TEMPO ESTIMADO) \033[0m"
+echo -e "\033[1;32m   🛡️  WESLEY NAS OS (HD EXTERNO SAMSUNG CONECTADO)     \033[0m"
 echo -e "\033[1;36m========================================================\033[0m"
 
 # 1. Permissões de Armazenamento e Wake-Lock
@@ -19,11 +19,11 @@ termux-wake-lock 2>/dev/null || true
 echo -e "\033[1;33m[2/4] Verificando ambiente Python...\033[0m"
 pkg install -y python 2>/dev/null || true
 
-# 3. Limpar configurações antigas de caminhos
 DIR_BASE=$(dirname "$(realpath "$0")")
-rm -f "$DIR_BASE/custom_drives.json" 2>/dev/null || true
 mkdir -p "$DIR_BASE/static"
 
+# 3. Criar interface visual
+echo -e "\033[1;33m[3/4] Atualizando interface visual...\033[0m"
 cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 <!DOCTYPE html>
 <html lang="pt-BR" class="dark">
@@ -158,7 +158,7 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 
   <input type="file" id="mainFileInput" multiple class="hidden" onchange="handleFileUpload(this.files)">
 
-  <!-- MODAL DE STATUS DE CÓPIA / TRANSFERÊNCIA EM TEMPO REAL -->
+  <!-- MODAL DE STATUS DE CÓPIA EM TEMPO REAL -->
   <div id="uploadStatusModal" class="fixed inset-0 z-50 bg-black/75 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-700/80 rounded-3xl p-6 max-w-lg w-full shadow-2xl relative overflow-hidden">
       <div class="absolute -top-10 -right-10 w-32 h-32 bg-brand-500/20 rounded-full blur-2xl pointer-events-none"></div>
@@ -176,12 +176,10 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
         </div>
       </div>
 
-      <!-- Barra de Progresso Principal -->
       <div class="w-full bg-slate-950 rounded-full h-3.5 overflow-hidden p-0.5 border border-slate-800 mb-3.5">
         <div id="uploadMainProgressBar" class="bg-gradient-to-r from-brand-600 via-indigo-500 to-emerald-400 h-full rounded-full transition-all duration-150" style="width: 0%"></div>
       </div>
 
-      <!-- Painel de Telemetria de Cópia -->
       <div class="grid grid-cols-3 gap-2 bg-slate-950/80 border border-slate-800/80 rounded-2xl p-3 text-center mb-5">
         <div>
           <span class="text-[10px] uppercase font-bold text-slate-400 block">Progresso</span>
@@ -206,7 +204,7 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
     </div>
   </div>
 
-  <!-- MODAL DE VISUALIZAÇÃO DE MÍDIA -->
+  <!-- MODAL DE MÍDIA -->
   <div id="viewerModal" class="fixed inset-0 z-50 bg-black/90 hidden flex flex-col p-4">
     <div class="flex items-center justify-between pb-3 border-b border-slate-800">
       <span id="viewerTitle" class="text-sm font-bold text-white truncate"></span>
@@ -370,7 +368,7 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
     }
     function closeViewerModal() { document.getElementById('viewerModal').classList.add('hidden'); document.getElementById('viewerContentBox').innerHTML = ''; }
 
-    // UPLOAD COM PROGRESSO, VELOCIDADE E TEMPO RESTANTE ESTIMADO
+    // UPLOAD COM PROGRESSO, VELOCIDADE E TEMPO ESTIMADO
     function handleFileUpload(files) {
       if(!files || !files.length || !currentDirectory) return;
 
@@ -480,8 +478,8 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 </html>
 HTMLEOF
 
-# 4. Criar backend Python app.py
-echo -e "\033[1;33m[4/4] Configurando backend Python com deduplicação de OTG...\033[0m"
+# 4. Backend Python app.py
+echo -e "\033[1;33m[4/4] Configurando backend Python com suporte ao HD FA0C-D005...\033[0m"
 cat << 'PYEOF' > "$DIR_BASE/app.py"
 #!/usr/bin/env python3
 import os, sys, json, shutil, urllib.parse, mimetypes, zipfile, tempfile, re, secrets, time
@@ -496,11 +494,6 @@ AUTH_PASS = os.environ.get("NAS_PASS", "210769")
 ACTIVE_SESSIONS = {}
 SESSION_EXPIRY = 7 * 24 * 3600
 
-SYSTEM_IGNORE = [
-    "adb", "mtp", "ptp", "cd-rom", "runtime", "appfuse", "expand", 
-    "media_rw", "self", "knox", "container", "asec", "obb", "secure"
-]
-
 def is_valid_token(token):
     if not token: return False
     if token in ACTIVE_SESSIONS:
@@ -510,28 +503,17 @@ def is_valid_token(token):
 
 def get_storage_drives():
     drives = []
-    seen_devices = set()
     seen_paths = set()
 
     def add_drive(drive_id, name, path, drive_type):
-        if not path or not os.path.exists(path): return
+        if not path: return
         real_path = os.path.realpath(path)
-        base_name = os.path.basename(real_path).lower()
-
-        if any(base_name == kw for kw in SYSTEM_IGNORE): return
-        if any(f"/{kw}" in real_path.lower() for kw in ["/runtime", "/appfuse", "/expand", "/dev/usb-ffs"]): return
-
+        if not os.path.exists(real_path) or real_path in seen_paths: return
         try:
-            stat = os.stat(real_path)
-            dev_id = stat.st_dev
             usage = shutil.disk_usage(real_path)
-
             if usage.total < 100 * 1024 * 1024: return
-            if dev_id in seen_devices or real_path in seen_paths: return
 
-            seen_devices.add(dev_id)
             seen_paths.add(real_path)
-
             drives.append({
                 "id": drive_id, "name": name, "path": real_path, "type": drive_type,
                 "total": usage.total, "used": usage.used, "free": usage.free,
@@ -542,40 +524,48 @@ def get_storage_drives():
     # 1. Armazenamento Interno
     add_drive("internal", "Armazenamento Interno", "/storage/emulated/0", "internal")
 
-    # 2. Termux Storage Framework (~/storage/external-*)
-    termux_storage = os.path.expanduser("~/storage")
-    if os.path.exists(termux_storage):
-        try:
-            for item in os.listdir(termux_storage):
-                if item.startswith("external"):
-                    target = os.path.realpath(os.path.join(termux_storage, item))
-                    add_drive("usb_otg_main", "USB OTG (Pen Drive / HD)", target, "otg")
-        except Exception: pass
-
-    # 3. Caminhos em Português
-    for pt_cand in ["/armazenamento usb 1", "/Armazenamento USB 1", "/storage/armazenamento usb 1", "/mnt/armazenamento usb 1"]:
-        if os.path.exists(pt_cand): add_drive("usb_pt_cand", "USB OTG (Pen Drive / HD)", pt_cand, "otg")
-
-    # 4. Varredura /storage/ (Padrão Android XXXX-XXXX)
-    if os.path.exists("/storage"):
-        try:
-            for item in os.listdir("/storage"):
-                if re.match(r'^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$', item):
-                    full_p = os.path.join("/storage", item)
-                    if os.path.isdir(full_p): add_drive(f"storage_{item}", f"USB OTG ({item})", full_p, "otg")
-        except Exception: pass
-
-    # 5. Varredura limpa em /proc/mounts
+    # 2. Varredura Inteligente do /proc/mounts (Detecta o seu HD vold/sdfat/exfat)
     if os.path.exists("/proc/mounts"):
         try:
             with open("/proc/mounts", "r") as f:
                 for line in f:
                     parts = line.split()
                     if len(parts) >= 3:
-                        mp, fs = parts[1], parts[2].lower()
-                        if (mp.startswith("/storage/") or mp.startswith("/mnt/media_rw/")) and not any(x in mp for x in ["/emulated", "/self", "/knox"]):
-                            if any(valid_fs in fs for valid_fs in ["vfat", "exfat", "ntfs", "fuse", "sdcardfs"]):
-                                add_drive(f"mount_{os.path.basename(mp)}", "USB OTG (Pen Drive / HD)", mp, "otg")
+                        dev, mp, fs = parts[0], parts[1], parts[2].lower()
+                        if "vold" in dev or any(x in fs for x in ["sdfat", "exfat", "vfat", "ntfs", "fuseblk"]):
+                            if not any(x in mp for x in ["/emulated", "/self", "/knox", "apex"]):
+                                uuid = os.path.basename(mp)
+                                candidate_paths = [
+                                    f"/storage/{uuid}",
+                                    f"/mnt/user/0/{uuid}",
+                                    f"/mnt/pass_through/0/{uuid}",
+                                    f"/mnt/runtime/default/{uuid}",
+                                    f"/mnt/media_rw/{uuid}",
+                                    mp
+                                ]
+                                for cand in candidate_paths:
+                                    if os.path.exists(cand):
+                                        add_drive(f"otg_{uuid}", f"HD Externo USB ({uuid})", cand, "otg")
+                                        break
+        except Exception: pass
+
+    # 3. Varredura /storage
+    if os.path.exists("/storage"):
+        try:
+            for item in os.listdir("/storage"):
+                if re.match(r'^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$', item):
+                    p = os.path.join("/storage", item)
+                    add_drive(f"storage_{item}", f"HD Externo USB ({item})", p, "otg")
+        except Exception: pass
+
+    # 4. Termux Storage
+    termux_storage = os.path.expanduser("~/storage")
+    if os.path.exists(termux_storage):
+        try:
+            for item in os.listdir(termux_storage):
+                if item.startswith("external"):
+                    target = os.path.realpath(os.path.join(termux_storage, item))
+                    add_drive("termux_ext", "HD Externo USB", target, "otg")
         except Exception: pass
 
     return drives
