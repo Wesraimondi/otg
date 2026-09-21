@@ -7,7 +7,7 @@
 
 clear
 echo -e "\033[1;36m========================================================\033[0m"
-echo -e "\033[1;32m   🛡️  WESLEY NAS OS (FILTRAGEM DE DISCOS OTG LIMPO)    \033[0m"
+echo -e "\033[1;32m   🛡️  WESLEY NAS OS (STATUS DE CÓPIA & TEMPO ESTIMADO) \033[0m"
 echo -e "\033[1;36m========================================================\033[0m"
 
 # 1. Permissões de Armazenamento e Wake-Lock
@@ -43,6 +43,7 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.7); }
     ::-webkit-scrollbar-thumb { background: rgba(71, 85, 105, 0.7); border-radius: 9999px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.9); }
     .file-card { transition: all 0.16s ease-in-out; }
     .file-card:hover { transform: translateY(-2px); }
     .glass-panel { background: rgba(30, 41, 59, 0.75); backdrop-filter: blur(12px); }
@@ -157,6 +158,55 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
 
   <input type="file" id="mainFileInput" multiple class="hidden" onchange="handleFileUpload(this.files)">
 
+  <!-- MODAL DE STATUS DE CÓPIA / TRANSFERÊNCIA EM TEMPO REAL -->
+  <div id="uploadStatusModal" class="fixed inset-0 z-50 bg-black/75 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700/80 rounded-3xl p-6 max-w-lg w-full shadow-2xl relative overflow-hidden">
+      <div class="absolute -top-10 -right-10 w-32 h-32 bg-brand-500/20 rounded-full blur-2xl pointer-events-none"></div>
+
+      <div class="flex items-center space-x-3 mb-5">
+        <div class="w-12 h-12 rounded-2xl bg-brand-600/20 border border-brand-500/30 text-brand-400 flex items-center justify-center shadow-lg animate-pulse">
+          <i data-lucide="copy" class="w-6 h-6"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>Copiando para o NAS</span>
+            <span id="uploadBatchCount" class="text-xs font-normal text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full">1/1</span>
+          </h3>
+          <p id="uploadCurrentFileName" class="text-xs text-slate-300 truncate font-medium mt-0.5">Preparando transferência...</p>
+        </div>
+      </div>
+
+      <!-- Barra de Progresso Principal -->
+      <div class="w-full bg-slate-950 rounded-full h-3.5 overflow-hidden p-0.5 border border-slate-800 mb-3.5">
+        <div id="uploadMainProgressBar" class="bg-gradient-to-r from-brand-600 via-indigo-500 to-emerald-400 h-full rounded-full transition-all duration-150" style="width: 0%"></div>
+      </div>
+
+      <!-- Painel de Telemetria de Cópia -->
+      <div class="grid grid-cols-3 gap-2 bg-slate-950/80 border border-slate-800/80 rounded-2xl p-3 text-center mb-5">
+        <div>
+          <span class="text-[10px] uppercase font-bold text-slate-400 block">Progresso</span>
+          <span id="uploadPercentNumber" class="text-sm font-black text-white">0%</span>
+        </div>
+        <div class="border-x border-slate-800">
+          <span class="text-[10px] uppercase font-bold text-slate-400 block">Velocidade</span>
+          <span id="uploadSpeedText" class="text-sm font-black text-emerald-400">0 MB/s</span>
+        </div>
+        <div>
+          <span class="text-[10px] uppercase font-bold text-slate-400 block">Tempo Restante</span>
+          <span id="uploadEtaText" class="text-sm font-black text-brand-400">Calculando...</span>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 font-medium px-1">
+        <span id="uploadTransferredBytes">0 MB de 0 MB</span>
+        <button onclick="cancelCurrentUpload()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-rose-600/80 hover:text-white text-slate-300 transition text-xs font-semibold">
+          Cancelar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE VISUALIZAÇÃO DE MÍDIA -->
   <div id="viewerModal" class="fixed inset-0 z-50 bg-black/90 hidden flex flex-col p-4">
     <div class="flex items-center justify-between pb-3 border-b border-slate-800">
       <span id="viewerTitle" class="text-sm font-bold text-white truncate"></span>
@@ -168,9 +218,22 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
   <script>
     let authToken = localStorage.getItem("nas_token") || "";
     let currentDirectory = "", currentActiveDrive = null, folderContents = [];
+    let currentUploadXhr = null;
 
     function authHeaders() { return { "Authorization": `Bearer ${authToken}` }; }
-    function formatBytes(b) { if(!b) return '0 B'; let k=1024, s=['B','KB','MB','GB','TB'], i=Math.floor(Math.log(b)/Math.log(k)); return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+s[i]; }
+    function formatBytes(b, decimals = 1) {
+      if(!b || b === 0) return '0 B';
+      let k = 1024, s = ['B','KB','MB','GB','TB'], i = Math.floor(Math.log(b)/Math.log(k));
+      return parseFloat((b/Math.pow(k,i)).toFixed(decimals)) + ' ' + s[i];
+    }
+
+    function formatTime(seconds) {
+      if(isNaN(seconds) || seconds <= 0) return "Poucos segundos";
+      if(seconds < 60) return `${Math.round(seconds)} seg`;
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.round(seconds % 60);
+      return `${mins} min ${secs > 0 ? secs + 's' : ''}`;
+    }
 
     async function initApp() {
       lucide.createIcons();
@@ -307,12 +370,95 @@ cat << 'HTMLEOF' > "$DIR_BASE/static/index.html"
     }
     function closeViewerModal() { document.getElementById('viewerModal').classList.add('hidden'); document.getElementById('viewerContentBox').innerHTML = ''; }
 
+    // UPLOAD COM PROGRESSO, VELOCIDADE E TEMPO RESTANTE ESTIMADO
     function handleFileUpload(files) {
-      if(!files.length || !currentDirectory) return;
+      if(!files || !files.length || !currentDirectory) return;
+
+      const modal = document.getElementById('uploadStatusModal');
+      const progressBar = document.getElementById('uploadMainProgressBar');
+      const percentNumber = document.getElementById('uploadPercentNumber');
+      const speedText = document.getElementById('uploadSpeedText');
+      const etaText = document.getElementById('uploadEtaText');
+      const transferredBytes = document.getElementById('uploadTransferredBytes');
+      const fileNameEl = document.getElementById('uploadCurrentFileName');
+      const batchCount = document.getElementById('uploadBatchCount');
+
+      batchCount.textContent = `${files.length} arquivo(s)`;
+      fileNameEl.textContent = files.length === 1 ? files[0].name : `${files[0].name} e mais ${files.length - 1}...`;
+      progressBar.style.width = "0%";
+      percentNumber.textContent = "0%";
+      speedText.textContent = "Calculando...";
+      etaText.textContent = "Calculando...";
+      transferredBytes.textContent = `0 B de ${formatBytes(Array.from(files).reduce((a, b) => a + b.size, 0))}`;
+      modal.classList.remove('hidden');
+
       const fd = new FormData();
       fd.append("target_path", currentDirectory);
       for(let f of files) fd.append("files", f);
-      fetch('/api/upload', { method: 'POST', headers: authHeaders(), body: fd }).then(() => loadFolder(currentDirectory));
+
+      const startTime = Date.now();
+      let lastLoaded = 0;
+      let lastTime = startTime;
+
+      const xhr = new XMLHttpRequest();
+      currentUploadXhr = xhr;
+
+      xhr.open("POST", "/api/upload", true);
+      xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+
+      xhr.upload.onprogress = (e) => {
+        if(e.lengthComputable) {
+          const now = Date.now();
+          const percent = Math.round((e.loaded / e.total) * 100);
+          progressBar.style.width = `${percent}%`;
+          percentNumber.textContent = `${percent}%`;
+          transferredBytes.textContent = `${formatBytes(e.loaded)} de ${formatBytes(e.total)}`;
+
+          const timeDiff = (now - lastTime) / 1000;
+          if (timeDiff >= 0.5 || e.loaded === e.total) {
+            const bytesDiff = e.loaded - lastLoaded;
+            const currentSpeed = bytesDiff / timeDiff;
+            const totalElapsed = (now - startTime) / 1000;
+            const avgSpeed = e.loaded / totalElapsed;
+
+            const effectiveSpeed = currentSpeed > 0 ? currentSpeed : avgSpeed;
+            speedText.textContent = `${formatBytes(effectiveSpeed)}/s`;
+
+            const remainingBytes = e.total - e.loaded;
+            if (effectiveSpeed > 0) {
+              const secondsRemaining = remainingBytes / effectiveSpeed;
+              etaText.textContent = formatTime(secondsRemaining);
+            }
+
+            lastLoaded = e.loaded;
+            lastTime = now;
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        setTimeout(() => {
+          modal.classList.add('hidden');
+          currentUploadXhr = null;
+          loadFolder(currentDirectory);
+        }, 500);
+      };
+
+      xhr.onerror = () => {
+        modal.classList.add('hidden');
+        currentUploadXhr = null;
+        alert("Erro na conexão durante o envio.");
+      };
+
+      xhr.send(fd);
+    }
+
+    function cancelCurrentUpload() {
+      if(currentUploadXhr) {
+        currentUploadXhr.abort();
+        currentUploadXhr = null;
+        document.getElementById('uploadStatusModal').classList.add('hidden');
+      }
     }
 
     function createNewFolder() {
