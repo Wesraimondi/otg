@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+
+# Encerra caso algum comando falhe
+set -e
+
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${BLUE}==============================================${NC}"
+echo -e "${BLUE}    INSTALAÇÃO: NAS + COCKPIT + AGENTE IA     ${NC}"
+echo -e "${BLUE}==============================================${NC}"
+
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${YELLOW}Por favor, execute este script com sudo ou como root.${NC}"
+  exit 1
+fi
+
+# 1. Atualização do Sistema
+echo -e "\n${GREEN}[1/6] Atualizando o sistema...${NC}"
+apt update && apt upgrade -y
+
+# 2. Utilitários Essenciais
+echo -e "\n${GREEN}[2/6] Instalando pacotes básicos de rede e hardware...${NC}"
+apt install -y \
+    curl \
+    wget \
+    git \
+    net-tools \
+    htop \
+    iotop \
+    ncdu \
+    smartmontools \
+    cifs-utils \
+    samba-common
+
+# 3. Cockpit e Gerenciamento de Armazenamento
+echo -e "\n${GREEN}[3/6] Instalando Cockpit (painel de controle e discos)...${NC}"
+apt install -y \
+    cockpit \
+    cockpit-storaged \
+    cockpit-networkmanager \
+    cockpit-packagekit
+
+systemctl enable --now cockpit.socket
+
+# 4. CasaOS (inclui Docker automaticamente)
+echo -e "\n${GREEN}[4/6] Instalando CasaOS...${NC}"
+curl -fsSL https://get.casaos.io | bash
+
+# 5. Instalação da Stack de IA (Ollama + Open WebUI via Docker)
+echo -e "\n${GREEN}[5/6] Instalando o Ollama (motor de IA)...${NC}"
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Baixa um modelo leve e versátil (ótimo para escrita e brainstorming mesmo sem placa de vídeo potente)
+echo -e "\n${GREEN}[5/6 - Cont.] Baixando modelo Llama 3.2 para escrita...${NC}"
+ollama pull llama3.2:3b
+
+echo -e "\n${GREEN}[5/6 - Cont.] Subindo a interface Open WebUI via Docker...${NC}"
+docker run -d \
+  --network=host \
+  -v open-webui:/app/backend/data \
+  -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+  --name open-webui \
+  --restart always \
+  ghcr.io/open-webui/open-webui:main
+
+# 6. Resumo Final
+SERVER_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I | awk '{print $1}')
+
+echo -e "\n${BLUE}==============================================${NC}"
+echo -e "${GREEN}       INSTALAÇÃO FINALIZADA COM SUCESSO!     ${NC}"
+echo -e "${BLUE}==============================================${NC}"
+echo -e "Painéis disponíveis na sua rede:"
+echo -e "  ➜  ${YELLOW}Agente de Escrita (Open WebUI):${NC} http://${SERVER_IP}:8080"
+echo -e "  ➜  ${YELLOW}CasaOS (Nuvem, Mídia e Apps):${NC}  http://${SERVER_IP}"
+echo -e "  ➜  ${YELLOW}Cockpit (Discos e Hardware):${NC}   https://${SERVER_IP}:9090"
+echo -e "${BLUE}==============================================${NC}"
