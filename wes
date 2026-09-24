@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+# Script para adicionar o domínio e IP do Tailscale aos domínios confiáveis do Nextcloud
+set -e
+
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+echo -e "${BLUE}====================================================${NC}"
+echo -e "${BLUE}     AJUSTANDO TRUSTED DOMAINS DO NEXTCLOUD         ${NC}"
+echo -e "${BLUE}====================================================${NC}"
+
+# 1. Validação de privilégios de superusuário
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}[ERRO] Execute este script com sudo: sudo ./fix-nextcloud-domains.sh${NC}"
+  exit 1
+fi
+
+# 2. Identificação automática do container do Nextcloud
+CONTAINER_NAME=$(docker ps --format '{{.Names}}' | grep -i nextcloud | head -n 1)
+
+if [ -z "$CONTAINER_NAME" ]; then
+  echo -e "${RED}[ERRO] Nenhum container ativo com o nome 'nextcloud' foi encontrado.${NC}"
+  echo -e "Certifique-se de que o Nextcloud está em execução (via CasaOS ou Docker)."
+  exit 1
+fi
+
+echo -e "${GREEN}Container detectado:${NC} $CONTAINER_NAME"
+
+# 3. Identificação do IP do Tailscale
+TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
+DOMAIN="nas.tail38f388.ts.net"
+
+# 4. Inclusão dos domínios via OCC (utilitário nativo do Nextcloud)
+echo -e "\n${YELLOW}Configurando domínio do Tailscale: ${DOMAIN}...${NC}"
+docker exec --user www-data "$CONTAINER_NAME" php occ config:system:set trusted_domains 2 --value="$DOMAIN"
+
+if [ -n "$TAILSCALE_IP" ]; then
+  echo -e "${YELLOW}Configurando IP do Tailscale: ${TAILSCALE_IP}...${NC}"
+  docker exec --user www-data "$CONTAINER_NAME" php occ config:system:set trusted_domains 3 --value="$TAILSCALE_IP"
+fi
+
+# 5. Exibe a lista atualizada de domínios cadastrados
+echo -e "\n${GREEN}Lista atualizada de Trusted Domains:${NC}"
+docker exec --user www-data "$CONTAINER_NAME" php occ config:system:get trusted_domains
+
+echo -e "\n${BLUE}====================================================${NC}"
+echo -e "${GREEN} Configuração aplicada com sucesso!${NC}"
+echo -e " Recarregue o navegador em: http://${DOMAIN}"
+echo -e "${BLUE}====================================================${NC}"
